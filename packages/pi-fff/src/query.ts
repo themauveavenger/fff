@@ -7,6 +7,12 @@ export function normalizePathConstraint(
   let trimmed = pathConstraint.trim();
   if (!trimmed) return trimmed;
 
+  if (trimmed.startsWith('@"') && trimmed.endsWith('"')) {
+    trimmed = trimmed.slice(2, -1);
+  } else if (trimmed.startsWith("@")) {
+    trimmed = trimmed.slice(1);
+  }
+
   if (path.isAbsolute(trimmed)) {
     const relative = path.relative(cwd, trimmed).replaceAll(path.sep, "/");
     if (relative === "") return null;
@@ -49,6 +55,17 @@ export function normalizePathConstraint(
 // the same way as the include path so bare dirs become PathSegment excludes.
 // Tolerate callers passing already-negated forms like `!src/` by stripping
 // the leading `!` before normalizing so we never double-negate (`!!src/`).
+function splitExcludeParts(raw: string): string[] {
+  const trimmed = raw.trim();
+  if ((trimmed.startsWith('@"') || trimmed.startsWith('!@"')) && trimmed.endsWith('"')) {
+    return [trimmed];
+  }
+  return trimmed
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export function normalizeExcludes(
   exclude: string | string[] | undefined,
   cwd = process.cwd(),
@@ -57,11 +74,7 @@ export function normalizeExcludes(
   const list = Array.isArray(exclude) ? exclude : [exclude];
   const out: string[] = [];
   for (const raw of list) {
-    const parts = raw
-      .split(/[,\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    for (const p of parts) {
+    for (const p of splitExcludeParts(raw)) {
       const stripped = p.startsWith("!") ? p.slice(1) : p;
       const normalized = normalizePathConstraint(stripped, cwd);
       if (normalized) out.push(`!${normalized}`);

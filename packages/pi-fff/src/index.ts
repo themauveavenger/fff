@@ -563,12 +563,14 @@ export default function fffExtension(pi: ExtensionAPI) {
     name: toolNames.grep,
     label: toolNames.grep,
     description: `Grep file contents. Smart-case, auto-detects regex vs literal, git-aware. Results are ranked by frecency (most-accessed files first); matches within a file stay in source order. Default limit ${DEFAULT_GREP_LIMIT}.`,
-    promptSnippet: "Grep contents",
+    promptSnippet:
+      "Search file contents with smart-case literal/regex matching, path/exclude filters, frecency-ranked files, and cursor pagination",
     promptGuidelines: [
-      "Prefer bare identifiers as patterns. Literal queries are most efficient.",
-      "Use path for include ('src/', '*.ts') and exclude for noise ('test/,*.min.js').",
-      "caseSensitive: true when you need exact case (smart-case otherwise).",
-      "After 1-2 greps, read the top match instead of more greps.",
+      `Use ${toolNames.grep} for content search; use ${toolNames.find} for file/path discovery.`,
+      `For ${toolNames.grep}, prefer concrete identifiers or strings as pattern; avoid wildcard-only patterns like '.*'.`,
+      `For ${toolNames.grep}, use path for include constraints ('src/', '*.ts') and exclude for noise ('test/', '*.min.js').`,
+      `For ${toolNames.grep}, omit caseSensitive for smart-case; set caseSensitive: true only when exact case matters.`,
+      `After 1-2 ${toolNames.grep} calls, read the best matching file instead of continuing to grep.`,
     ],
     parameters: grepSchema,
 
@@ -726,14 +728,15 @@ export default function fffExtension(pi: ExtensionAPI) {
     name: toolNames.find,
     label: toolNames.find,
     description: `Fuzzy path search and glob search. Matches against the whole repo-relative path, not just the filename. Frecency-ranked, git-aware. Multi-word = narrower (AND). Default limit ${DEFAULT_FIND_LIMIT}.`,
-    promptSnippet: "Find files by path or glob",
+    promptSnippet:
+      "Find files by fuzzy whole-path or glob search with frecency/git ranking and cursor pagination",
     promptGuidelines: [
-      "Matches the WHOLE path, not just the filename — `profile` hits `chrome/browser/profiles/x.cc` too.",
-      "Keep queries to 1-2 terms; extra words narrow.",
-      "Use for paths, not content. Use grep for content.",
-      "For exact path matches use a glob in `path` — e.g. path: '**/profile.h' for exact filename, or path: 'src/**/profile.h' scoped to a subtree. Bare patterns are fuzzy.",
-      "To list everything inside a directory, pass path: 'dir/**' with an empty or wildcard pattern instead of using pattern alone.",
-      "Use exclude: 'test/,*.min.js' to cut noise in large repos.",
+      `Use ${toolNames.find} before bash or directory-listing tools when the user names a file, concept, feature, or symbol.`,
+      `${toolNames.find} searches the whole repo-relative path, not just the filename; 'profile' can match 'chrome/browser/profiles/x.cc'.`,
+      `For ${toolNames.find}, keep pattern to 1-2 terms; extra words narrow results.`,
+      `For ${toolNames.find}, use path for scope ('src/', '**/profile.h') and exclude for noise ('test/', '*.min.js').`,
+      `Use ${toolNames.find} for paths, not content; use ${toolNames.grep} for content.`,
+      `To list a directory with ${toolNames.find}, use path: 'dir/**' and pattern: '*'.`,
     ],
     parameters: findSchema,
 
@@ -850,11 +853,12 @@ export default function fffExtension(pi: ExtensionAPI) {
       label: toolNames.multiGrep,
       description:
         "Search file contents for ANY of multiple literal patterns (OR, SIMD Aho-Corasick). Faster than regex alternation.",
-      promptSnippet: "Multi-pattern OR content search",
+      promptSnippet:
+        "Search file contents for any of several literal patterns with OR semantics",
       promptGuidelines: [
-        "Use when searching for several identifiers at once.",
-        "Include all naming-convention variants (snake/camel/Pascal).",
-        "Patterns are literal. Use constraints for file filters.",
+        `Use ${toolNames.multiGrep} only when searching for several literal identifiers at once.`,
+        `For ${toolNames.multiGrep}, include naming variants such as snake_case, camelCase, and PascalCase when relevant.`,
+        `For ${toolNames.multiGrep}, patterns are literal; use constraints for file filters.`,
       ],
       parameters: multiGrepSchema,
 

@@ -30,6 +30,19 @@ describe("path constraint normalization", () => {
     ).toBe(".agents/ !test/ *");
   });
 
+  test("strips leading @ mention syntax from path constraints", () => {
+    expect(normalizePathConstraint("@src/main.rs", cwd)).toBe("src/main.rs");
+    expect(normalizePathConstraint('@"src/file with spaces.ts"', cwd)).toBe(
+      "src/file with spaces.ts",
+    );
+    expect(buildQuery("@src", "needle", '@test/**', cwd)).toBe(
+      "src/ !test/ needle",
+    );
+    expect(buildQuery("src", "needle", '!@test/**', cwd)).toBe(
+      "src/ !test/ needle",
+    );
+  });
+
   test("treats path='.' as workspace root (no constraint)", () => {
     expect(normalizePathConstraint(".", cwd)).toBeNull();
     expect(normalizePathConstraint("./", cwd)).toBeNull();
