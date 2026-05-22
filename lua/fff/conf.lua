@@ -6,6 +6,7 @@ local M = {}
 --- @field prompt_position string
 --- @field preview_position string
 --- @field preview_size number
+--- @field min_list_height number
 --- @field show_scrollbar boolean
 --- @field path_shorten_strategy string
 
@@ -213,6 +214,10 @@ local function init()
         size = 130, -- column threshold: if screen width >= size, use preview_position; otherwise use wrap
         wrap = 'top', -- position to use when screen is narrower than size
       },
+      -- Minimum list height required to render the preview. When the available
+      -- list area would drop below this on small terminals, the preview is
+      -- auto-hidden so the file list stays usable. Set to 0 to disable.
+      min_list_height = 10,
       show_scrollbar = true, -- Show scrollbar for pagination
       -- How to shorten long directory paths in the file list:
       -- 'middle' (default): always uses dots (a/./b, a/../b, a/.../b)
@@ -264,7 +269,7 @@ local function init()
     },
     hl = {
       border = 'FloatBorder',
-      normal = 'Normal',
+      normal = 'NormalFloat',
       matched = 'IncSearch',
       title = 'Title',
       prompt = 'Question',
@@ -306,6 +311,19 @@ local function init()
       grep_fuzzy_active = 'DiagnosticHint', -- Highlight for keybind + label when fuzzy is on
       -- Cross-mode suggestion highlights
       suggestion_header = 'WarningMsg', -- Highlight for the "No results found. Suggested..." banner
+      -- File info panel highlights
+      file_info_section = 'FFFFileInfoSection', -- Section header label (e.g. "file", "score")
+      file_info_separator = 'FFFFileInfoSeparator', -- Dash dividers used like a border
+      file_info_label = 'FFFFileInfoLabel', -- Row labels (Size, Type, Git, ...)
+      file_info_value = 'FFFFileInfoValue', -- Plain values
+      file_info_value_dim = 'FFFFileInfoValueDim', -- Tertiary values, separators inside rows
+      file_info_size = 'FFFFileInfoSize', -- File size value
+      file_info_type = 'FFFFileInfoType', -- Filetype value
+      file_info_path = 'FFFFileInfoPath', -- Full path value
+      file_info_total_score = 'FFFFileInfoTotalScore', -- Total score (bold)
+      file_info_match_type = 'FFFFileInfoMatchType', -- match_type label (bold)
+      file_info_score_pos = 'FFFFileInfoScorePos', -- Positive score components
+      file_info_score_neg = 'FFFFileInfoScoreNeg', -- Negative score components / penalties
     },
     -- Store file open frecency
     frecency = {
@@ -326,6 +344,15 @@ local function init()
     debug = {
       enabled = false, -- Show file info panel in preview
       show_scores = false, -- Show scores inline in the UI
+      show_file_info = {
+        file_info = true, -- Size, type, git status, frecency
+        score_breakdown = true, -- Total + match type, bonuses, modifiers, penalty
+        -- Modified + accessed timestamps. Pass a boolean to toggle the
+        -- whole section, or a table to hide individual rows:
+        --   timings = { modified = false, accessed = true }
+        timings = true,
+        full_path = true, -- Full absolute path at the bottom
+      },
     },
     logging = {
       enabled = true,
@@ -350,6 +377,24 @@ local function init()
   local migrated_user_config = handle_deprecated_config(config)
   local merged_config = vim.tbl_deep_extend('force', default_config, migrated_user_config)
 
+  -- Normalise show_file_info: accept a boolean shorthand or a partial table
+  local sfi = merged_config.debug and merged_config.debug.show_file_info
+  local default_sections = { file_info = true, score_breakdown = true, timings = true, full_path = true }
+  if type(sfi) == 'boolean' then
+    merged_config.debug.show_file_info = {
+      file_info = sfi,
+      score_breakdown = sfi,
+      timings = sfi,
+      full_path = sfi,
+    }
+  elseif type(sfi) == 'table' then
+    for k, v in pairs(default_sections) do
+      if sfi[k] == nil then sfi[k] = v end
+    end
+  else
+    merged_config.debug.show_file_info = default_sections
+  end
+
   state.config = merged_config
 end
 
@@ -361,6 +406,17 @@ function M.setup(config) vim.g.fff = config end
 function M.get()
   if not state.config then init() end
   return state.config
+end
+
+--- True when preview rendering is requested by config. Defaults to `true`
+--- when `config` (or its `preview` block) is missing so callers don't have
+--- to guard against partial state during init.
+--- @param config? FffConfig Optional config; falls back to `M.get()` when nil.
+--- @return boolean
+function M.preview_enabled(config)
+  config = config or M.get()
+  if not config or not config.preview then return true end
+  return config.preview.enabled
 end
 
 --- @return boolean state_changed

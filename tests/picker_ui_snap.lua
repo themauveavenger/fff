@@ -27,6 +27,13 @@ local function setup(geometry, opts)
   child.o.lines = geometry.rows
   child.o.columns = geometry.cols
 
+  local debug_enabled = opts.debug == true
+  -- Default show_file_info hides timings: Modified/Accessed timestamps drift
+  -- between runs and would otherwise force `ignore_text` on those rows. Tests
+  -- can override (or restore) by passing `opts.show_file_info`.
+  local show_file_info = opts.show_file_info
+    or { file_info = true, score_breakdown = true, timings = false, full_path = true }
+
   child.lua(
     string.format(
       [[
@@ -41,7 +48,11 @@ local function setup(geometry, opts)
           frecency = { enabled = true, db_path = %q },
           history  = { enabled = true, db_path = %q },
           logging  = { enabled = false },
-          debug    = { enabled = %s, show_scores = %s },
+          debug    = {
+            enabled = %s,
+            show_scores = %s,
+            show_file_info = %s,
+          },
         }
         require('fff.core').ensure_initialized()
         require('fff.rust').wait_for_initial_scan(8000)
@@ -51,8 +62,9 @@ local function setup(geometry, opts)
       geometry.winborder or '',
       fixture.frecency_db,
       fixture.history_db,
-      tostring(opts.debug == true),
-      tostring(opts.debug == true)
+      tostring(debug_enabled),
+      tostring(debug_enabled),
+      vim.inspect(show_file_info)
     )
   )
 end
@@ -86,9 +98,13 @@ local LAYOUTS = {
   { name = 'wide', cols = 180, rows = 40, winborder = 'double' },
   { name = 'default', cols = 140, rows = 32 }, -- standard on most screens
   { name = 'narrow', cols = 70, rows = 24, winborder = 'rounded' },
+  -- Extra-wide: exists primarily so the file_info panel hits the H2 layout.
+  { name = 'xwide', cols = 240, rows = 48 },
 }
 
 local T = MiniTest.new_set()
+
+local PROMPT_POSITIONS = { 'bottom', 'top' }
 
 for _, geometry in ipairs(LAYOUTS) do
   local set = MiniTest.new_set({
@@ -98,53 +114,72 @@ for _, geometry in ipairs(LAYOUTS) do
     },
   })
 
-  set['empty_bottom'] = function()
-    open_picker('bottom')
-    assert_snapshot_match()
-  end
+  -- Run every per-geometry case for both prompt positions: layout math and
+  -- list rendering diverge between top/bottom (see AGENTS.md), so a snapshot
+  -- on a single side would silently miss regressions in the other.
+  for _, prompt in ipairs(PROMPT_POSITIONS) do
+    set['empty_' .. prompt] = function()
+      open_picker(prompt)
+      assert_snapshot_match()
+    end
 
-  set['empty_top'] = function()
-    open_picker('top')
-    assert_snapshot_match()
-  end
+    set['query_main_' .. prompt] = function()
+      open_picker(prompt, 'main')
+      assert_snapshot_match()
+    end
 
-  set['query_main_bottom'] = function()
-    open_picker('bottom', 'main')
-    assert_snapshot_match()
-  end
+    set['no_results_' .. prompt] = function()
+      open_picker(prompt, 'zzzzzzzzz')
+      assert_snapshot_match()
+    end
 
-  set['no_results_bottom'] = function()
-    open_picker('bottom', 'zzzzzzzzz')
-    assert_snapshot_match()
-  end
-
-  set['cursor_second_item'] = function()
-    open_picker('bottom')
-    child.type_keys('<Down>')
-    vim.loop.sleep(200)
-    assert_snapshot_match()
+    set['cursor_second_item_' .. prompt] = function()
+      open_picker(prompt)
+      -- Bottom prompt visually goes up with <Down>; top prompt goes down with <Down>.
+      -- Either way one keypress moves to the second item — what we want to capture.
+      child.type_keys('<Down>')
+      vim.loop.sleep(200)
+      assert_snapshot_match()
+    end
   end
 
   T[geometry.name] = set
 end
 
--- File info panel only renders in non-flex layouts where there's room for it,
--- so we only exercise it on the default geometry.
-local default_geom = LAYOUTS[2]
-local debug_set = MiniTest.new_set({
+-- File info panel snapshots. Timings are disabled at the config level (see
+-- `setup`) so the snapshots stay deterministic — Modified/Accessed timestamps
+-- drift between runs. We snapshot a narrow and a wide variant for both prompt
+-- positions to keep the adaptive panel layout (label widths, section headers,
+-- top vs bottom prompt geometry) covered.
+local debug_narrow_set = MiniTest.new_set({
   hooks = {
-    pre_case = function() setup(default_geom, { debug = true }) end,
+    pre_case = function() setup(LAYOUTS[2], { debug = true }) end, -- default 140x32, panel ~57 cols
     post_case = teardown,
   },
 })
 
-debug_set['file_info_panel'] = function()
-  open_picker('bottom', 'main')
-  -- Modified / Last Access timestamps drift between runs; ignore those text
-  -- rows but still verify everything else (panel layout, scores, attrs).
-  assert_snapshot_match({ ignore_text = { 13, 14 } })
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  debug_narrow_set['file_info_panel_' .. prompt] = function()
+    open_picker(prompt, 'main')
+    assert_snapshot_match()
+  end
 end
-T['debug'] = debug_set
+T['debug_narrow'] = debug_narrow_set
+
+local debug_wide_set = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup(LAYOUTS[4], { debug = true }) end, -- xwide 240x48, panel ~96 cols
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  debug_wide_set['file_info_panel_' .. prompt] = function()
+    open_picker(prompt, 'main')
+    assert_snapshot_match()
+  end
+end
+T['debug_wide'] = debug_wide_set
 
 T['combo'] = MiniTest.new_set({
   hooks = {
@@ -166,19 +201,14 @@ local function train_combo()
   vim.loop.sleep(400)
 end
 
-T['combo']['boost_bottom'] = function()
-  train_combo()
-  open_picker('bottom', 'main')
-  -- Combo overlay float renders asynchronously after render_list.
-  vim.loop.sleep(400)
-  assert_snapshot_match()
-end
-
-T['combo']['boost_top'] = function()
-  train_combo()
-  open_picker('top', 'main')
-  vim.loop.sleep(400)
-  assert_snapshot_match()
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['combo']['boost_' .. prompt] = function()
+    train_combo()
+    open_picker(prompt, 'main')
+    -- Combo overlay float renders asynchronously after render_list.
+    vim.loop.sleep(400)
+    assert_snapshot_match()
+  end
 end
 
 T['scrollbar'] = MiniTest.new_set({
@@ -188,17 +218,22 @@ T['scrollbar'] = MiniTest.new_set({
   },
 })
 
-T['scrollbar']['next_page'] = function()
-  open_picker('bottom')
-  -- Bottom prompt iters in reverse — `<Up>` advances cursor toward higher
-  -- indices (visually up the list). Walking past the last in-page item
-  -- triggers load_next_page; the scrollbar thumb appears at the new offset.
-  for _ = 1, 30 do
-    child.type_keys('<Up>')
-    vim.loop.sleep(20)
+-- Cursor advance key differs by prompt position: bottom prompt iterates the
+-- list in reverse so `<Up>` walks toward higher indices; top prompt is
+-- conventional. Either way we walk past the last in-page item to trigger
+-- load_next_page and surface the scrollbar thumb at the new offset.
+local SCROLL_KEY = { bottom = '<Up>', top = '<Down>' }
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['scrollbar']['next_page_' .. prompt] = function()
+    open_picker(prompt)
+    for _ = 1, 30 do
+      child.type_keys(SCROLL_KEY[prompt])
+      vim.loop.sleep(20)
+    end
+    vim.loop.sleep(400)
+    assert_snapshot_match()
   end
-  vim.loop.sleep(400)
-  assert_snapshot_match()
 end
 
 return T
