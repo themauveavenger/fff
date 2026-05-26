@@ -1210,11 +1210,13 @@ impl FilePicker {
     pub fn get_scan_progress(&self) -> ScanProgress {
         let scanned_count = self.scanned_files_count.load(Ordering::Relaxed);
         let is_scanning = self.signals.scanning.load(Ordering::Relaxed);
+
         ScanProgress {
             scanned_files_count: scanned_count,
             is_scanning,
             is_watcher_ready: self.signals.watcher_ready.load(Ordering::Relaxed),
-            is_warmup_complete: self.sync_data.bigram_index.is_some(),
+            is_warmup_complete: !self.enable_content_indexing
+                || self.sync_data.bigram_index.is_some(),
         }
     }
 
@@ -1463,11 +1465,10 @@ impl FilePicker {
         let (mut file_item, rel_path) =
             FileItem::new(path_for_index.to_path_buf(), &self.base_path, None);
 
-        // Lazily create the shared overflow builder if not exists yet
-        let builder = self
-            .sync_data
-            .overflow_builder
-            .get_or_insert_with(|| crate::simd_path::ChunkedPathStoreBuilder::new(64));
+        let builder = self.sync_data.overflow_builder.get_or_insert_with(|| {
+            // we know that overflow would never create more files during the file
+            crate::simd_path::ChunkedPathStoreBuilder::new(MAX_OVERFLOW_FILES)
+        });
 
         let chunked_path = builder.add_file_immediate(&rel_path, file_item.path.filename_offset);
         file_item.set_path(chunked_path);
@@ -1986,7 +1987,12 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
         ext,
         // Images
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "tiff" | "tif" | "avif" |
-        "heic" | "psd" | "icns" | "cur" | "raw" | "cr2" | "nef" | "dng" | "tga" |
+        "heic" | "heif" | "jxl" | "jp2" | "j2k" | "psd" | "icns" | "cur" | "cr2" |
+        "nef" | "dng" | "tga" |
+        // GPU / VFX texture formats
+        "rgbe" | "hdr" | "exr" | "dds" | "ktx" | "ktx2" | "pvr" | "astc" |
+        // Adobe Illustrator (PDF wrapper) / Apple webarchive / MIME HTML archive
+        "ai" | "webarchive" | "mhtml" |
         // Video/Audio
         "mp4" | "avi" | "mov" | "wmv" | "mkv" | "mp3" | "wav" | "flac" | "ogg" | "m4a" |
         "aac" | "webm" | "flv" | "mpg" | "mpeg" | "wma" | "opus" | "pcm" | "reapeaks" |
@@ -2010,30 +2016,27 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
         // Compiled/Runtime
         "class" | "pyc" | "pyo" | "wasm" | "dex" | "jar" | "war" |
         // OCaml / Swift / Objective-C build artefacts
-        "cmi" | "cmt" | "cmti" | "cmx" | "cof" | "cop" | "nib" |
+        "cmi" | "cmt" | "cmti" | "cmx" | "nib" |
         "swiftdeps" | "swiftdeps~" | "swiftdoc" | "swiftmodule" | "swiftsourceinfo" |
         // ML/Data Science
-        "npy" | "npz" | "pkl" | "pickle" | "h5" | "hdf5" | "pt" | "pth" | "onnx" |
-        "safetensors" | "tfrecord" |
+        "npy" | "npz" | "pkl" | "pickle" | "h5" | "hdf5" | "pt" | "onnx" |
+        "safetensors" | "tfrecord" | "tflite" | "gguf" | "ggml" | "joblib" |
         // 3D/Game assets
-        "glb" | "fbx" | "blend" | "blp" |
-        // Compressed-text formats (gzip/binary on disk)
-        "dia" | "tfx" | "flm" | "bcmap" | "journal" |
+        "glb" | "blend" | "blp" |
+        // Gzipped-XML / binary maps
+        "dia" | "bcmap" |
         // Protobuf wire format
         "pb" |
         // Data/serialized
         "parquet" | "arrow" |
         // IDE/OS metadata
-        "DS_Store" | "suo"
+        "suo"
     )
 }
 
-/// Detect binary content by checking for NUL bytes in the first 512 bytes.
-/// Called lazily when file content is first loaded, not during initial scan.
 #[inline]
 pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
-    let check_len = content.len().min(512);
-    content[..check_len].contains(&0)
+    memchr::memchr(0, content).is_some()
 }
 
 /// Length of the longest shared directory prefix of two relative dir
