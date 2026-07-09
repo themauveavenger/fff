@@ -582,7 +582,9 @@ export default function fffExtension(pi: ExtensionAPI) {
     promptSnippet:
       "Search file contents with smart-case literal/regex matching, path/exclude filters, frecency-ranked files, and cursor pagination",
     promptGuidelines: [
-      `Use ${toolNames.grep} for content search; use ${toolNames.find} for file/path discovery.`,
+      `Use ${toolNames.grep} for content search within the current workspace/base path; use built-in grep or bash for content outside it.`,
+      `${toolNames.grep} is workspace-scoped, not a system-wide search tool.`,
+      `If ${toolNames.grep} cannot cover the task because you need to search outside the current workspace/base path, prefer pi's built-in grep tool if available; otherwise use shell grep/rg via bash.`,
       `For ${toolNames.grep}, prefer concrete identifiers or strings as pattern; avoid wildcard-only patterns like '.*'.`,
       `For ${toolNames.grep}, use path for include constraints ('src/', '*.ts') and exclude for noise ('test/', '*.min.js').`,
       `For ${toolNames.grep}, omit caseSensitive for smart-case; set caseSensitive: true only when exact case matters.`,
@@ -747,8 +749,11 @@ export default function fffExtension(pi: ExtensionAPI) {
     promptSnippet:
       "Find files by fuzzy whole-path or glob search with frecency/git ranking and cursor pagination",
     promptGuidelines: [
-      `Use ${toolNames.find} before bash or directory-listing tools when the user names a file, concept, feature, or symbol.`,
-      `${toolNames.find} searches the whole repo-relative path, not just the filename; 'profile' can match 'chrome/browser/profiles/x.cc'.`,
+      `Use ${toolNames.find} for file and path discovery within the current workspace/base path.`,
+      `${toolNames.find} is workspace-scoped, not a general filesystem crawler.`,
+      `If ${toolNames.find} cannot cover the task because you need to search outside the current workspace/base path or across the whole filesystem, prefer pi's built-in find tool if available; otherwise use shell find via bash.`,
+      `Use ${toolNames.find} before bash or directory-listing tools when the user names a file, concept, feature, or symbol within the workspace.`,
+      `${toolNames.find} searches the whole workspace-relative path, not just the filename; 'profile' can match 'chrome/browser/profiles/x.cc'.`,
       `For ${toolNames.find}, keep pattern to 1-2 terms; extra words narrow results.`,
       `For ${toolNames.find}, use path for scope ('src/', '**/profile.h') and exclude for noise ('test/', '*.min.js').`,
       `Use ${toolNames.find} for paths, not content; use ${toolNames.grep} for content.`,
