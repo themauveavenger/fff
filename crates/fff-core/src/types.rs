@@ -4,9 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(not(target_os = "windows"))]
+use crate::constants::{FRESH_MMAP_THRESHOLD, MMAP_THRESHOLD};
+use crate::constants::{MAX_CACHED_CONTENT_BYTES, MAX_FFFILE_SIZE, PATH_BUF_SIZE};
 use crate::constraints::Constrainable;
 use crate::query_tracker::QueryMatchEntry;
-use crate::simd_path::{ArenaPtr, PATH_BUF_SIZE};
+use crate::simd_path::ArenaPtr;
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
 
 /// Different sources of the string storage used by FFF
@@ -95,7 +98,7 @@ impl Clone for DirItem {
 impl DirItem {
     #[inline(always)]
     pub fn is_overflow(&self) -> bool {
-        self.flags & DirFlags::OVERFLOW == 0
+        self.flags & DirFlags::OVERFLOW != 0
     }
 
     pub(crate) fn new(path: crate::simd_path::ChunkedString, last_segment_offset: u16) -> Self {
@@ -202,6 +205,11 @@ impl Constrainable for DirItem {
     fn git_status(&self) -> Option<git2::Status> {
         None
     }
+
+    #[inline]
+    fn is_overflow(&self) -> bool {
+        DirItem::is_overflow(self)
+    }
 }
 
 #[derive(Debug)]
@@ -235,6 +243,18 @@ impl Clone for FileItem {
             content: OnceLock::new(),
         }
     }
+}
+
+/// Single-block read used by the binary classifier. Most binaries reveal a
+/// NUL byte within the first filesystem block, so 16 KB lets one read settle
+/// the classification for typical files while keeping the scratch buffer
+/// small enough to live on the stack.
+pub const BINARY_CLASSIFICATION_CHUNK_SIZE: usize = 16 * 1024;
+
+/// A file is treated as binary if any NUL byte appears in the scanned prefix.
+#[inline]
+pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
+    memchr::memchr(0, content).is_some()
 }
 
 impl FileItem {
@@ -352,7 +372,12 @@ impl FileItem {
 
         let base_end_idx = base_len + sep_len;
         let relative_portion_str = self.path.read_to_buf(arena, &mut buf[base_end_idx..]);
-        let total = base_end_idx + relative_portion_str.len();
+        let rel_len = relative_portion_str.len();
+        let total = base_end_idx + rel_len;
+        // Stored relative paths are '/'-canonical; rewrite to the OS-native
+        // separator so the result matches git-cache keys, the frecency DB, and
+        // Win32 file APIs. No-op off Windows.
+        crate::path_utils::nativize_slashes_in_place(&mut buf[base_end_idx..total]);
         Path::new(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
     }
 
@@ -499,6 +524,38 @@ impl FileItem {
         }
     }
 
+    /// Chunked classifier of the binary content of the file chunk by chunk
+    /// accepts path which to reuse the allocated buffer for absolute path read
+    pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
+        if self.size == 0 {
+            return;
+        }
+
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(false)
+            .read(true)
+            .open(path)
+        else {
+            tracing::error!(path = ?path.display(), "Failed to open indexed file");
+            return;
+        };
+
+        loop {
+            match file.read(chunk) {
+                Ok(0) => break,
+                Err(e) => {
+                    tracing::error!(?e, "Failed to read file chunk");
+                    break;
+                }
+                Ok(n) => {
+                    if detect_binary_content(&chunk[..n]) {
+                        self.set_binary(true);
+                    }
+                }
+            }
+        }
+    }
+
     #[inline]
     pub fn is_deleted(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & FileItemFlags::DELETED != 0
@@ -597,13 +654,7 @@ impl FileItem {
 
     /// Returns a reference to a cached mmap of the file's contents.
     ///
-    /// SAFETY-CRITICAL: callers must hold the picker read lock for as long as
-    /// the returned slice is in use. The watcher mutates `FileItem` (including
-    /// `invalidate_mmap`) under the picker write lock, so the read lock is
-    /// what prevents UAF (`OnceLock` reset → `munmap`) and SIGBUS (in-place
-    /// truncate → access past new EOF). Detached background tasks (e.g. the
-    /// bigram builder running on `BACKGROUND_THREAD_POOL`) MUST NOT call this
-    /// — use `read_trimmed_into_buf` instead.
+    /// SAFETY-CRITICAL: callers must hold the picker read lock for as long as the returned slice is in use.
     #[cfg(not(target_os = "windows"))]
     pub(crate) fn get_cached_content(
         &self,
@@ -615,10 +666,6 @@ impl FileItem {
             return Some(content);
         }
 
-        // Skip caching when mmap can't pay for itself. Files under one page
-        // worth of bytes waste kernel VM structures and a per-file syscall
-        // pair — the chunked `read_into_buf` fallback is cheaper for them
-        // and hits the OS page cache on repeat reads anyway.
         if self.size < MMAP_THRESHOLD || self.size > budget.max_file_size {
             return None;
         }
@@ -654,16 +701,20 @@ impl FileItem {
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
-        buf: &'a mut Vec<u8>, // we allow it to grow
+        buf: &'a mut Vec<u8>,
+        #[cfg_attr(target_os = "windows", allow(unused_variables))] mmap_slot: &'a mut MmapSlot,
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
     ) -> Option<&'a [u8]> {
-        // Fast path: persistent cache hit (zero-copy). Safe here because grep
-        // callers hold the picker read lock for the lifetime of the returned
-        // slice — see [`Self::get_cached_content`] safety note.
-        if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
-            return Some(cached);
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Fast path: persistent cache hit (zero-copy). Safe here because
+            // grep callers hold the picker read lock for the lifetime of the
+            // returned slice — see [`Self::get_cached_content`] safety note.
+            if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
+                return Some(cached);
+            }
         }
 
         let max_file_size = budget.max_file_size;
@@ -671,26 +722,34 @@ impl FileItem {
             return None;
         }
 
-        // Slow path: read into the reusable buffer — open() + read_exact() + close().
-        // No mmap()/munmap() syscalls, no page table setup/teardown.
-        // We know the exact size so we use read_exact (1 read syscall) instead of
-        // read_to_end (2 read syscalls — one for data, one for EOF confirmation).
         let abs = self.absolute_path(arena, base_path);
+
+        #[cfg(not(target_os = "windows"))]
+        if self.size >= FRESH_MMAP_THRESHOLD {
+            let file = std::fs::File::open(&abs).ok()?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+            let stored = mmap_slot.insert(mmap);
+            return Some(&stored[..]);
+        } else {
+            let _ = (mmap_slot, arena);
+        }
+
         let len = self.size as usize;
         buf.resize(len, 0);
+
         let mut file = std::fs::File::open(&abs).ok()?;
         file.read_exact(buf).ok()?;
         Some(buf.as_slice())
     }
 }
 
-/// Files smaller than one page waste the remainder when mmapped.
-/// Files smaller than one page waste the remainder when mmapped. Unused
-/// on Windows where the persistent content cache is disabled.
-#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
-const MMAP_THRESHOLD: u64 = 16 * 1024;
-#[cfg(all(not(target_os = "windows"), not(target_arch = "aarch64")))]
-const MMAP_THRESHOLD: u64 = 4 * 1024;
+/// Per-thread scratch slot owning a transient mmap returned from
+/// [`FileItem::get_content_for_search`]. `Option<Mmap>` on Unix,
+/// unit on Windows where mmap is unused.
+#[cfg(not(target_os = "windows"))]
+pub type MmapSlot = Option<memmap2::Mmap>;
+#[cfg(target_os = "windows")]
+pub type MmapSlot = ();
 
 impl Constrainable for FileItem {
     #[inline]
@@ -706,6 +765,11 @@ impl Constrainable for FileItem {
     #[inline]
     fn git_status(&self) -> Option<git2::Status> {
         self.git_status
+    }
+
+    #[inline]
+    fn is_overflow(&self) -> bool {
+        FileItem::is_overflow(self)
     }
 }
 
@@ -807,10 +871,6 @@ impl Default for MixedItemRef<'_> {
     }
 }
 
-const MAX_MMAP_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
-const MAX_CACHED_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
-
 #[derive(Debug)]
 pub struct ContentCacheBudget {
     pub max_files: usize,
@@ -825,7 +885,7 @@ impl ContentCacheBudget {
         Self {
             max_files: usize::MAX,
             max_bytes: u64::MAX,
-            max_file_size: MAX_MMAP_FILE_SIZE,
+            max_file_size: MAX_FFFILE_SIZE,
             cached_count: AtomicUsize::new(0),
             cached_bytes: AtomicU64::new(0),
         }
@@ -867,7 +927,7 @@ impl ContentCacheBudget {
         Self {
             max_files,
             max_bytes,
-            max_file_size: MAX_MMAP_FILE_SIZE,
+            max_file_size: MAX_FFFILE_SIZE,
             cached_count: AtomicUsize::new(0),
             cached_bytes: AtomicU64::new(0),
         }

@@ -1,6 +1,7 @@
+use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
-use crate::file_picker::{FFFMode, MAX_OVERFLOW_FILES};
-use crate::git::GitStatusCache;
+use crate::file_picker::FFFMode;
+use crate::git_status_worker::GitStatusWorker;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use git2::Repository;
@@ -25,7 +26,6 @@ pub struct BackgroundWatcher {
 }
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
-const MAX_PATHS_THRESHOLD: usize = 1024;
 /// On macOS, each `watch()` call creates a separate FSEventStream. When the
 /// number of directories exceeds this threshold we fall back to a single
 /// recursive watch to avoid exhausting the per-process stream limit.
@@ -35,12 +35,17 @@ const MAX_MACOS_NONRECURSIVE_WATCHES: usize = 4096;
 const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
 
 impl BackgroundWatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
+        enable_fs_root_scanning: bool,
+        enable_home_dir_scanning: bool,
+        git_status_worker: Arc<GitStatusWorker>,
+        trace_span: tracing::Span,
     ) -> Result<Self, Error> {
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
@@ -48,42 +53,39 @@ impl BackgroundWatcher {
             mode,
         );
 
-        // Refuse to watch the filesystem root or the user's home directory.
-        // These are prone to high-volume event churn (editor temp files,
-        // browser caches, log rotations) which inflates the overflow arena
-        // and, on macOS, can exhaust the per-process FSEvents stream limit.
-        if base_path.parent().is_none()
-            || Some(base_path.as_os_str()) == dirs::home_dir().as_ref().map(|p| p.as_os_str())
-        {
+        // by default we do not want to allow users to search their FS root, this is very error prone
+        // though some consumers would specifically allow that e.g. unikernels, windows disc
+        // partition or sub file systems. By default - fail, unless user permits
+        let is_fs_root = base_path.parent().is_none();
+        // use rust's path api for maximum reliability of the comparison
+        let is_home_dir = Some(&base_path) == dirs::home_dir().as_ref();
+
+        if (is_fs_root && !enable_fs_root_scanning) || (is_home_dir && !enable_home_dir_scanning) {
             return Err(Error::FilesystemRoot(base_path));
         }
 
         // macOS: always use a single recursive FSEvent stream.
-        //
         // Per-dir NonRecursive watches create one FSEvent stream per dir.
         // The per-process FSEvent cap is lower than expected in practice
         // (4096 per process, but FFF usually is running within code editors),
         // and each failed `watch()` after the cap blocks ~40 ms on kernel retry.
         // Yes we pay for filtering events on handler phase but it is usable
         //
-        // macOS and Windows use a single recursive watch. FSEvents and
-        // ReadDirectoryChangesW both support true kernel-level recursion
-        // on one handle — per-dir NonRecursive watches burn streams/handles
-        // for no benefit and, on Windows, have been observed to silently
-        // drop Modify events for nested paths.
+        // Windows doesn't seem to have a hard cap, but in practice non recursive watching
+        // does a way worse job and often looses events which is not an option for us.
         //
         // Linux keeps the per-dir NonRecursive strategy: inotify has no
-        // kernel-level recursion, so Recursive here would still register
-        // one watch per subdir but without the ignored-dir filtering we
-        // get by iterating `picker.for_each_dir` ourselves.
+        // kernel-level watcher recursion, so we have to manually watch every single interested
+        // directory for watch events which is in practice stable and fast if system has enough
+        // spare watcher (configurable by the user, usually 100k - 1m)
         let use_recursive = cfg!(any(target_os = "macos", target_os = "windows"));
 
         let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
         let watch_tx_for_debouncer = watch_tx.clone();
 
         let owner_weak_picker = shared_picker.weaken();
-        let owner_frecency = shared_frecency.clone();
         let owner_git_workdir = git_workdir.clone();
+        let owner_git_worker = Arc::clone(&git_status_worker);
 
         let debouncer = Self::create_debouncer(
             base_path,
@@ -93,6 +95,7 @@ impl BackgroundWatcher {
             mode,
             use_recursive,
             watch_tx_for_debouncer,
+            git_status_worker,
         )?;
 
         info!("Background file watcher initialized successfully");
@@ -104,9 +107,11 @@ impl BackgroundWatcher {
         #[cfg(target_os = "linux")]
         let owner_debouncer = Arc::clone(&debouncer);
 
+        let owner_span = trace_span.clone();
         let owner_thread = std::thread::Builder::new()
             .name("fff-watcher-own".into())
             .spawn(move || {
+                let _g = owner_span.enter();
                 while let Ok(dir) = watch_rx.recv() {
                     // if the picker is dropped we do need to exit the loop
                     let Some(strong_picker) = owner_weak_picker.upgrade() else {
@@ -143,8 +148,8 @@ impl BackgroundWatcher {
                     track_files_from_new_directories(
                         &dir,
                         &strong_picker,
-                        &owner_frecency,
                         &owner_git_workdir,
+                        &owner_git_worker,
                     );
 
                     // Transient strong ref drops here, back
@@ -162,6 +167,7 @@ impl BackgroundWatcher {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
@@ -170,6 +176,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         use_recursive: bool,
         watch_tx: mpsc::Sender<PathBuf>,
+        git_status_worker: Arc<GitStatusWorker>,
     ) -> Result<Debouncer, Error> {
         let config = Config::default()
             // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
@@ -180,44 +187,34 @@ impl BackgroundWatcher {
             // our own grep calls and preview window rendering
             .with_event_kinds(EventKindMask::CORE);
 
-        // `use_recursive` was decided by the caller from a cheap size hint,
-        // so the event-handler closure can capture it directly.
-        //
-        // The closure lives on the debouncer's internal event thread
-        // for as long as the debouncer exists — i.e. the full
-        // lifetime of `BackgroundWatcher`. Capturing a strong
-        // `SharedFilePicker` here would re-introduce the Arc cycle
-        // we just broke with `owner_picker`'s `downgrade()` above.
-        // Capture a weak handle instead and upgrade per-batch.
         let git_workdir_for_handler = git_workdir.clone();
+        let base_path_for_handler = base_path.clone();
         let shared_picker_for_watching = shared_picker.clone();
-        let event_picker = shared_picker.weaken();
+        let file_picker = shared_picker.weaken();
         let mut debouncer = new_debouncer_opt(
             DEBOUNCE_TIMEOUT,
             Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
             {
                 move |result: DebounceEventResult| match result {
                     Ok(events) => {
-                        // Upgrade just long enough to drive one
-                        // debounced batch. Failure means every
-                        // external `SharedFilePicker` has already
-                        // dropped and teardown is already underway.
-                        let Some(strong_picker) = event_picker.upgrade() else {
+                        let Some(file_picker) = file_picker.upgrade() else {
                             return;
                         };
 
                         let new_dirs = handle_debounced_events(
-                            events,
-                            &git_workdir_for_handler,
-                            &strong_picker,
-                            &shared_frecency,
                             mode,
+                            events,
+                            &base_path_for_handler,
+                            &git_workdir_for_handler,
+                            &file_picker,
+                            &shared_frecency,
+                            &git_status_worker,
                         );
 
-                        // every new directory creates had to be reflected in the picker state
+                        // every new directory created has to be reflected in the picker state
                         for dir in new_dirs {
                             if let Err(e) = watch_tx.send(dir) {
-                                warn!(?e, "Failed to send directory update error");
+                                error!(?e, "Failed to send directory update error");
                             }
                         }
                     }
@@ -234,29 +231,8 @@ impl BackgroundWatcher {
             config,
         )?;
 
-        // Watching strategy:
-        //
-        // For small-to-medium repos we watch each indexed directory individually
-        // (NonRecursive). This avoids receiving events for gitignored paths like
-        // node_modules/ and keeps the event volume low.
-        //
-        // On macOS, each `watch()` call creates a separate FSEventStream. Large
-        // repos (e.g. Chromium with 487K+ files) can have tens of thousands of
-        // directories, which exhausts the per-process FSEvents stream limit and
-        // causes "unable to start FSEvent stream" errors. When the directory
-        // count exceeds the threshold we fall back to a single Recursive watch
-        // on the base path. FSEvents handles this efficiently with one kernel
-        // stream for the entire subtree. Gitignored paths are already filtered
-        // in the event handler via `should_include_file()`.
-        //
-        // On Linux (inotify), RecursiveMode::Recursive creates one kernel watch
-        // per subdirectory *including* gitignored ones, wasting file descriptors.
-        // The per-directory NonRecursive approach is always used on Linux.
-        //
-        // New directories created at runtime are detected via Create events on
-        // the parent and dynamically added by the owner thread via watch_tx.
-
         if use_recursive {
+            // if the platform supports native watcher recursion
             debouncer.watch(base_path.as_path(), RecursiveMode::Recursive)?;
             info!(
                 "File watcher initialized with single recursive watch on {} \
@@ -267,23 +243,13 @@ impl BackgroundWatcher {
         } else {
             debouncer.watch(base_path.as_path(), RecursiveMode::NonRecursive)?;
 
-            // Stream watch-dir registration directly under the picker
-            // read lock. Only Linux (inotify) reaches this branch —
-            // macOS always takes the recursive path above. `inotify`'s
-            // `inotify_add_watch()` is fast-fail: on ENOSPC it returns
-            // immediately, no kernel retry loop, so holding the read
-            // lock across the stream is O(ms) even for large repos.
-            //
-            // Abort the loop after a run of failures. Once ENOSPC hits,
-            // further calls won't succeed until the user raises
-            // `fs.inotify.max_user_watches`, so there's no value in
-            // continuing.
             const MAX_CONSECUTIVE_WATCH_FAILURES: usize = 16;
 
             let mut watched = 0usize;
             let mut consecutive_failures = 0usize;
-            let mut aborted_early = false;
 
+            // `inotify` is fast-fail: on ENOSPC it returns
+            // immediately, no kernel retry loop, so holding this lock is free
             if let Some(guard) = shared_picker_for_watching.read().ok()
                 && let Some(picker) = guard.as_ref()
             {
@@ -305,11 +271,9 @@ impl BackgroundWatcher {
                                 warn!(
                                     consecutive_failures,
                                     watched,
-                                    "Aborting NonRecursive watch loop — per-process \
-                                 watch cap exhausted, further dirs would just burn \
-                                 kernel time for no coverage"
+                                    "Giving up setting file watcher for all the directories. Check if your system has enough fs watchers limit."
                                 );
-                                aborted_early = true;
+
                                 ControlFlow::Break(())
                             } else {
                                 ControlFlow::Continue(())
@@ -319,46 +283,22 @@ impl BackgroundWatcher {
                 });
             }
 
-            info!(
-                "File watcher initialized for {} directories (NonRecursive) under {} (aborted_early={})",
-                watched,
-                base_path.display(),
-                aborted_early,
+            tracing::info!(
+                ?watched,
+                path = ?base_path.display(),
+                "File watcher initialized"
             );
         }
 
         // The .git directory is excluded from the file list but we still need
         // to observe changes that affect git status (staging, unstaging,
-        // committing, branch switches, merges, etc.).
-        // When using recursive mode the base watch already covers .git/,
-        // but these targeted watches are cheap (at most 3 extra streams)
-        // and ensure we catch status changes even if the recursive backend
-        // coalesces or delays .git events.
+        // committing, branch switches, merges, etc)
         watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
 
         Ok(debouncer)
     }
 
-    /// Signal the watcher to shut down without blocking on its worker
-    /// threads. Safe to call from any context, including while holding
-    /// the [`SharedFilePicker`] write lock.
-    ///
-    /// Both the debouncer's internal event loop and our owner thread
-    /// may call `SharedFilePicker::write()` inside their handlers. A
-    /// blocking join here would deadlock against a caller that already
-    /// holds that lock (e.g. `stop_background_monitor` under a
-    /// `shared_picker.write()` guard). Instead we:
-    ///
-    ///   * drop the `watch_tx` Sender — the owner thread's
-    ///     `watch_rx.recv()` returns `Err` and the thread exits at
-    ///     its next `recv`.
-    ///   * call `debouncer.stop_nonblocking()` — signals the debouncer
-    ///     event loop to exit on its next tick and drops the watcher,
-    ///     closing the FSEvent / inotify / ReadDirectoryChangesW stream.
-    ///   * detach both `JoinHandle`s.
-    ///
-    /// In-flight handler invocations finish on their own (at most one
-    /// more batch) once the caller releases any locks they hold.
+    /// Signals the background watcher threads to shut down, doesn't guarantee to deallocate immediately
     pub fn stop(&mut self) {
         self.watch_tx.take();
         if let Some(debouncer) = self.debouncer.lock().take() {
@@ -370,14 +310,6 @@ impl BackgroundWatcher {
         info!("Background file watcher stop signaled");
     }
 
-    /// Queue a non-recursive watch registration on `dir`.
-    ///
-    /// The owner thread is always blocked on `watch_rx.recv()`, so
-    /// the `send()` here wakes it immediately via the channel's
-    /// condvar — no external unpark needed.
-    ///
-    /// Returns `false` once `stop()` has dropped our `Sender` — any
-    /// further request is silently discarded.
     pub(crate) fn request_watch_dir(&self, dir: PathBuf) -> bool {
         match self.watch_tx.as_ref() {
             Some(tx) => tx.send(dir).is_ok(),
@@ -392,16 +324,25 @@ impl Drop for BackgroundWatcher {
     }
 }
 
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]
+#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_worker), level = Level::DEBUG)]
 fn handle_debounced_events(
+    mode: FFFMode,
     events: Vec<DebouncedEvent>,
+    base_path: &Path,
     git_workdir: &Option<PathBuf>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
-    mode: FFFMode,
+    git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
+    // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
+    // per batch so we don't hold the picker lock during filtering.
+    let walker_rules = shared_picker
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
+    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
     let mut need_full_rescan = false;
     let mut need_full_git_rescan = false;
     let mut paths_to_remove = Vec::new();
@@ -425,9 +366,18 @@ fn handle_debounced_events(
         }
 
         // When macOS FSEvents (or other backends) overflow their event buffer, the kernel
-        // drops individual events and emits a Rescan flag telling us to re-scan the subtree.
-        // Without handling this, modified source files can be silently missed.
+        // drops individual events and emits a rescan flag telling us to re-scan the subtree
         if debounced_event.event.need_rescan() {
+            if debounced_event.event.paths.len() < 16 // this should be usually one event
+                && debounced_event
+                    .paths
+                    .iter()
+                    // but we are smart enough and not falling into the paths
+                    .all(|p| should_include_file(p, &filter))
+            {
+                break;
+            }
+
             warn!(
                 "Received rescan event for paths {:?}, triggering full rescan",
                 debounced_event.event.paths
@@ -438,11 +388,15 @@ fn handle_debounced_events(
 
         tracing::debug!(event = ?debounced_event.event, "Processing FS event");
         for path in &debounced_event.event.paths {
-            if is_ignore_definition_path(path) {
+            if matches!(
+                path.file_name().and_then(|f| f.to_str()),
+                Some(".ignore") | Some(".gitignore")
+            ) {
                 info!(
                     "Detected change in ignore definition file: {}",
                     path.display()
                 );
+
                 need_full_rescan = true;
                 break;
             }
@@ -482,25 +436,23 @@ fn handle_debounced_events(
             } else if is_removal || !path.exists() {
                 paths_to_remove.push(path.as_path());
             } else if path.is_dir() {
-                // New directory — collect it so the caller can register a
-                // watcher. No filesystem scanning: files that arrive later
-                // will be handled by the newly registered watch.
-                if !is_path_ignored(path, &repo) {
+                if !is_path_ignored(path, &filter) {
                     new_dirs_to_watch.push(path.to_path_buf());
                 }
             } else {
                 // For additions/modifications, still filter gitignored files.
-                if should_include_file(path, &repo) {
+                if should_include_file(path, &filter) {
                     paths_to_add_or_modify.push(path.as_path());
                 }
             }
         }
 
         affected_paths_count += debounced_event.event.paths.len();
-        if affected_paths_count > MAX_PATHS_THRESHOLD {
+        if affected_paths_count > MAX_OVERFLOW_FILES {
             warn!(
-                "Too many affected paths ({}) in a single batch, triggering full rescan",
-                affected_paths_count
+                ?affected_paths_count,
+                max = MAX_OVERFLOW_FILES,
+                "Too many affected paths in a single batch, triggering full rescan",
             );
 
             need_full_rescan = true;
@@ -645,53 +597,15 @@ fn handle_debounced_events(
     }
 
     // do not try to update the paths if we anyway going to rescan everything from scratch
-    if !need_full_rescan && (need_full_git_rescan || !files_to_update_git_status.is_empty()) {
-        let git_workdir = repo
-            .as_ref()
-            .map(|r| r.workdir().unwrap_or_else(|| r.path()).to_path_buf());
-
-        let shared_picker = shared_picker.clone();
-        let shared_frecency = shared_frecency.clone();
-
-        // git status query even with a pathspec could be really slow, if we do this syncrhronously
-        // within the event handler, we actually risk of forming a snow ball of conflicting events
-        crate::file_picker::BACKGROUND_THREAD_POOL.spawn(move || {
-            let Some(git_path) = git_workdir else { return };
-            let Ok(repo) = Repository::open(&git_path) else {
-                error!("Failed to open git repo for async status update");
-                return;
-            };
-
-            if need_full_git_rescan && !need_full_rescan {
-                info!("Async: triggering full git rescan");
-                if let Err(e) = shared_picker.refresh_git_status(&shared_frecency) {
-                    error!("Failed to refresh git status: {:?}", e);
-                }
-            }
-
-            if !files_to_update_git_status.is_empty() {
-                let status = match GitStatusCache::git_status_for_paths(
-                    &repo,
-                    &files_to_update_git_status,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to query git status: {:?}", e);
-                        return;
-                    }
-                };
-
-                if let Ok(mut guard) = shared_picker.write()
-                    && let Some(ref mut picker) = *guard
-                {
-                    if let Err(e) = picker.update_git_statuses(status, &shared_frecency) {
-                        error!("Failed to update git statuses: {:?}", e);
-                    } else {
-                        info!("Async: git statuses updated");
-                    }
-                }
-            }
-        });
+    // no repo => no consumer thread, so don't accumulate paths nobody will drain
+    if !need_full_rescan && repo.is_some() {
+        if need_full_git_rescan {
+            // A full git rescan re-reads every tracked path (including ones that just
+            // went clean after a commit), so it already subsumes the per-path update.
+            git_status_worker.request_full_rescan();
+        } else if !files_to_update_git_status.is_empty() {
+            git_status_worker.enqueue_paths(files_to_update_git_status);
+        }
     }
 
     new_dirs_to_watch
@@ -702,20 +616,30 @@ fn handle_debounced_events(
 fn track_files_from_new_directories(
     dir: &Path,
     shared_picker: &SharedFilePicker,
-    shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
+    git_status_worker: &Arc<GitStatusWorker>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
 
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
+    // Prefer the walker's ignore rules; read base_path + rules from the picker.
+    let (base_path, walker_rules) = match shared_picker.read().ok().and_then(|g| {
+        g.as_ref()
+            .map(|p| (p.base_path().to_path_buf(), p.ignore_rules()))
+    }) {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    let filter = IgnoreFilter::new(&base_path, walker_rules, repo.as_ref());
     let mut files_to_add = Vec::new();
 
     for entry in entries.flatten() {
         if entry.file_type().is_ok_and(|ft| ft.is_file()) {
             let path = entry.path();
-            if should_include_file(&path, &repo) {
+            if should_include_file(&path, &filter) {
                 files_to_add.push(path);
             }
         }
@@ -724,6 +648,8 @@ fn track_files_from_new_directories(
     if files_to_add.is_empty() {
         return;
     }
+
+    let added = files_to_add.len();
 
     {
         let Ok(mut guard) = shared_picker.write() else {
@@ -739,61 +665,74 @@ fn track_files_from_new_directories(
         }
     }
 
-    if let Some(repo) = repo.as_ref() {
-        let status = match GitStatusCache::git_status_for_paths(repo, &files_to_add) {
-            Ok(status) => status,
-            Err(e) => {
-                tracing::error!(?e, "inject_existing_files: git status query failed");
-                return;
-            }
-        };
-
-        if let Ok(mut guard) = shared_picker.write()
-            && let Some(ref mut picker) = *guard
-            && let Err(e) = picker.update_git_statuses(status, shared_frecency)
-        {
-            error!("inject_existing_files: failed to update git statuses: {e:?}");
-        }
+    if repo.is_some() {
+        git_status_worker.enqueue_paths(files_to_add);
     }
 
     debug!(
         "Injected {} existing files from new directory {}",
-        files_to_add.len(),
+        added,
         dir.display(),
     );
 }
 
-fn should_include_file(path: &Path, repo: &Option<Repository>) -> bool {
+fn should_include_file(path: &Path, filter: &IgnoreFilter) -> bool {
     // Directories are not indexed — only regular files (and symlinks to files).
     if path.is_dir() {
         return false;
     }
-
-    match repo.as_ref() {
-        Some(repo) => repo.is_path_ignored(path) != Ok(true),
-        None => {
-            // No git repo — apply basic sanity filters.
-            // Hidden directories are skipped by the watcher setup (hidden(true)),
-            // but events can still arrive for files in known non-code directories.
-            !is_non_code_directory(path)
-        }
-    }
-}
-
-fn is_non_code_directory(path: &Path) -> bool {
-    crate::ignore::is_non_code_directory(path)
+    !filter.is_ignored(path)
 }
 
 #[inline]
-fn is_path_ignored(path: &Path, repo: &Option<Repository>) -> bool {
-    match repo.as_ref() {
-        Some(repo) => repo.is_path_ignored(path) == Ok(true),
-        None => is_non_code_directory(path),
+fn is_path_ignored(path: &Path, filter: &IgnoreFilter) -> bool {
+    filter.is_ignored(path)
+}
+
+struct IgnoreFilter<'a> {
+    base_path: &'a Path,
+    /// Reusable ignore rules from the last walk (zlob backend only).
+    rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
+    /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
+    /// caller's repo (also used for git-status queries) to avoid re-opening.
+    repo: Option<&'a Repository>,
+}
+
+impl<'a> IgnoreFilter<'a> {
+    fn new(
+        base_path: &'a Path,
+        rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
+        repo: Option<&'a Repository>,
+    ) -> Self {
+        Self {
+            base_path,
+            rules,
+            repo,
+        }
+    }
+
+    /// Whether `path` (absolute) is ignored.
+    fn is_ignored(&self, path: &Path) -> bool {
+        if let Some(rules) = self.rules.as_ref() {
+            let Ok(rel) = path.strip_prefix(self.base_path) else {
+                return false;
+            };
+            // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
+            // layer internally, so a leaf under an ignored directory (rule
+            // `build/`, path `build/out.rs`) is caught in one call.
+            return rules.is_ignored(rel);
+        }
+        match self.repo {
+            Some(repo) => repo.is_path_ignored(path) == Ok(true),
+            // No repo and no rules: fall back to the non-code-dir heuristic.
+            None => crate::ignore::is_non_code_directory(path),
+        }
     }
 }
 
 #[inline]
 pub(crate) fn is_git_file(path: &Path) -> bool {
+    // it could be in submodule
     path.components()
         .any(|component| component.as_os_str() == ".git")
 }
@@ -809,18 +748,14 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
         // Only react to changes that rewrite the worktree state: commits,
         // staging, checkouts, merges, conflict resolution. Ref-only updates
         // under refs/ (fetch, push, tag writes, pack-refs) do not change
-        // which files are modified/untracked, so we deliberately skip them —
+        // which files are modified/untracked, so we deliberately skip them
         // watching refs/ recursively would cost one inotify watch per ref
         // namespace on repos with many branches/remotes.
         if path_in_git_dir == Path::new("index") || path_in_git_dir == Path::new("index.lock") {
             return true;
         }
+
         if path_in_git_dir == Path::new("HEAD") {
-            return true;
-        }
-        if path_in_git_dir == Path::new("info/exclude")
-            || path_in_git_dir == Path::new("info/sparse-checkout")
-        {
             return true;
         }
 
@@ -834,13 +769,6 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
     false
 }
 
-fn is_ignore_definition_path(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|f| f.to_str()),
-        Some(".ignore") | Some(".gitignore")
-    )
-}
-
 fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBuf>) {
     let Some(workdir) = git_workdir else {
         return;
@@ -851,21 +779,10 @@ fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBu
         return;
     }
 
-    // Watch .git/ non-recursively to catch top-level files:
-    // index, index.lock, HEAD, MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD.
-    // We intentionally do NOT watch refs/ — individual ref updates don't
-    // affect worktree status, and a recursive watch there blows up inotify
-    // watch counts on repos with many branches/remotes/tags.
+    // We have tried to be smart about the internal git state but
+    // it appeared more harmful that it's worth it, so we just watch
+    // for the most obvious paths like HEAD, MERGE_HEAD, index.lock
     if let Err(e) = debouncer.watch(&git_dir, RecursiveMode::NonRecursive) {
         warn!("Failed to watch .git directory: {}", e);
-        return;
-    }
-
-    // Watch info/ non-recursively for exclude and sparse-checkout
-    let info_dir = git_dir.join("info");
-    if info_dir.is_dir()
-        && let Err(e) = debouncer.watch(&info_dir, RecursiveMode::NonRecursive)
-    {
-        warn!("Failed to watch .git/info: {}", e);
     }
 }

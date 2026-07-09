@@ -1,16 +1,21 @@
 ---@diagnostic disable: undefined-field, missing-fields
-local plugin_dir = vim.fn.fnamemodify(vim.fn.resolve(debug.getinfo(1, 'S').source:sub(2)), ':h:h')
-local log_file = vim.fs.normalize(plugin_dir .. '/fff-test.log')
-pcall(vim.fn.delete, log_file)
-
--- init_tracing uses OnceLock — first caller wins. Direct rust call BEFORE any
--- fff.* require, otherwise core.ensure_initialized() locks tracing to the
--- default config path and our trace dump on CI failure stays empty.
-pcall(require('fff.rust').init_tracing, log_file, 'trace')
-
 local fff = require('fff')
 local fff_rust = require('fff.rust')
 local file_picker = require('fff.file_picker')
+
+local plugin_dir = vim.fn.fnamemodify(vim.fn.resolve(debug.getinfo(1, 'S').source:sub(2)), ':h:h')
+local log_file = vim.fs.normalize(plugin_dir .. '/fff-test.log')
+
+local ok, session_log = pcall(require('fff.rust').init_tracing, log_file, 'trace')
+if not ok then session_log = nil end
+
+-- comment to get a local log of this file
+vim.api.nvim_create_autocmd('VimLeavePre', {
+  once = true,
+  callback = function()
+    if os.getenv('CI') == nil and session_log then pcall(vim.fn.delete, session_log) end
+  end,
+})
 
 local function init_picker_at_plugin_dir(timeout_ms)
   fff_rust.init_file_picker(plugin_dir)
@@ -203,6 +208,11 @@ describe('programmatic search APIs', function()
       local fd = assert(io.open(sandbox_root .. '/grep_target.lua', 'w'))
       fd:write('-- ' .. marker .. '\n')
       fd:close()
+
+      -- on windows metadata cache is updated lazily if we programmatically start searching
+      -- the new directory right after we update it we can sometimes see a race window especially on CI
+      -- this is fine in practice cause this is not a real use case for fff to search RIGHT AFTER mkdir
+      if vim.fn.has('win32') == 1 then vim.wait(250, function() return false end) end
 
       -- Marker must not exist anywhere in the primary fff.nvim tree.
       local before = fff.content_search(marker)

@@ -1,6 +1,6 @@
 [package]
 name = "fff-query-parser"
-version = "0.8.4"
+version = "0.9.6"
 edition = "2024"
 description = "Query parser for fff file finder - includes specific syntax for various constraints like globs, extensions, regex etc"
 license = "MIT"
@@ -10,7 +10,9 @@ authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlok.com>"]
 path = "src/lib.rs"
 
 [features]
-default = []
+# `ripgrep` = pure-Rust glob detection (default). `zlob` overrides it when set.
+default = ["ripgrep"]
+ripgrep = []
 zlob = ["dep:zlob"]
 
 [dependencies]

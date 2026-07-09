@@ -5,6 +5,9 @@
 //! by [frizbee](https://docs.rs/neo_frizbee), frecency scoring backed by LMDB,
 //! and multi-mode grep search.
 //!
+//! > [!Important performance information]  
+//! > For the most optimized fff build use `zlob` feature. It requires zig v0.16.0 to be installed on the machine.
+//!
 //! ## Architecture
 //!
 //! - [`file_picker::FilePicker`] — Main entry point. Indexes a directory tree in a
@@ -91,13 +94,22 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#[cfg(not(any(feature = "ripgrep", feature = "zlob")))]
+compile_error!(
+    "fff-search requires either the `ripgrep` (default) or `zlob` feature. \
+     Enable one, e.g. `--features ripgrep` or `--features zlob`."
+);
+
 mod background_watcher;
+mod git_status_worker;
+pub(crate) mod parallelism;
 mod scan;
 // public only for benchmarks — the inverted index is still re-exported via
 // `pub use bigram_filter::*` below for external consumers.
 #[doc(hidden)]
 pub mod bigram_filter;
 pub mod bigram_query;
+pub mod constants;
 mod constraints;
 mod error;
 mod score;
@@ -142,6 +154,7 @@ mod ignore;
 /// Thread-safe shared handles for [`FilePicker`], [`FrecencyTracker`],
 /// and [`QueryTracker`].
 pub mod shared;
+pub mod walk;
 
 pub use bigram_filter::*;
 pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};

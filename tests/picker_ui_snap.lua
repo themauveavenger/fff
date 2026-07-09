@@ -41,6 +41,7 @@ local function setup(geometry, opts)
         vim.opt.runtimepath:prepend(plugin)
         package.path = plugin .. '/lua/?.lua;' .. plugin .. '/lua/?/init.lua;' .. package.path
         vim.cmd('cd ' .. vim.fn.fnameescape(%q))
+        vim.cmd('syntax off')
         local winborder = %q
         if winborder ~= '' then vim.o.winborder = winborder end
         vim.g.fff = {
@@ -85,7 +86,9 @@ local function assert_snapshot_match(opts)
 end
 
 local function open_picker(prompt_position, query)
-  child.lua(string.format('require("fff.picker_ui").open({ layout = { prompt_position = %q } })', prompt_position))
+  child.lua(
+    string.format('require("fff.picker_ui.picker_ui").open({ layout = { prompt_position = %q } })', prompt_position)
+  )
   vim.loop.sleep(400)
 
   if query and query ~= '' then
