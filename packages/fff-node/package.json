@@ -17,6 +17,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "test": "node test/e2e.mjs && node test/watch.mjs",
     "typecheck": "tsc --noEmit"
   },
@@ -57,7 +58,9 @@
   },
   "homepage": "https://github.com/dmtrKovalenko/fff#readme",
   "dependencies": {
-    "ffi-rs": "^1.0.0"
+    "ffi-rs": "^1.0.0",
+    "typescript": "^5.0.0",
+    "@types/node": "^22.0.0"
   },
   "optionalDependencies": {
     "@ff-labs/fff-bin-darwin-arm64": "0.0.0",
@@ -69,8 +72,5 @@
     "@ff-labs/fff-bin-win32-x64": "0.0.0",
     "@ff-labs/fff-bin-win32-arm64": "0.0.0"
   },
-  "devDependencies": {
-    "typescript": "^5.0.0",
-    "@types/node": "^22.0.0"
-  }
+  "devDependencies": {}
 }
